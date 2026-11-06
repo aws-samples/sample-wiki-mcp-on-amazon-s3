@@ -4,6 +4,6 @@
   "license": "MIT-0",
   "description": "Pins the AWS CDK CLI that the Makefile and CI run.",
   "devDependencies": {
-    "aws-cdk": "2.1145.0"
+    "aws-cdk": "2.1147.0"
   }
 }
