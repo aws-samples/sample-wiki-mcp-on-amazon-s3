@@ -1,0 +1,126 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+# CI — docs/ARCHITECTURE.md §12.4 "repository and build practices".
+#
+# Every push and pull request: lint, types, unit tests, Lambda packaging, a full
+# `cdk synth` of all four stacks (dev config, placeholder certificate — no AWS
+# credentials are needed because nothing in the dev config does a context lookup),
+# a pip-audit of the Lambda dependencies with a CycloneDX SBOM artifact, and a secret
+# scan of the whole history with gitleaks. Actions and images are pinned by SHA/digest,
+# and the CDK CLI by package-lock.json (`npm ci`). Every job has a read-only token:
+# nothing here pushes, merges or opens a pull request, so Dependabot's pull requests
+# wait for a person.
+#
+# What this file cannot do:
+#
+#   * GitHub **push protection** and **secret scanning** are repository settings,
+#     not workflow steps. Enable both under Settings → Code security → "Secret
+#     scanning" and "Push protection" BEFORE the first push of real work:
+#     https://docs.github.com/en/code-security/secret-scanning/enabling-secret-scanning-features/enabling-push-protection-for-your-repository
+#     gitleaks below is the second net; push protection acts before a secret is public.
+#   * **Branch protection** on `main` with "require a pull request" and this
+#     workflow's `checks` job as a required status check is likewise a setting:
+#     Settings → Branches → Add rule.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # The dev config sets cfg.domain without a hosted zone, so a certificate ARN must be
+  # supplied. Synth never calls ACM; any well-formed ARN will do.
+  SYNTH_CERT_ARN: arn:aws:acm:us-west-2:000000000000:certificate/placeholder
+
+jobs:
+  checks:
+    name: lint · types · tests · build · synth
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Install (locked)
+        run: uv sync --locked
+
+      - name: Install the pinned CDK CLI
+        run: npm ci
+
+      - name: Ruff (lint)
+        run: uv run ruff check app infra tests scripts
+
+      - name: Ruff (format)
+        run: uv run ruff format --check app infra tests scripts
+
+      - name: mypy
+        run: uv run mypy app
+
+      - name: Unit tests
+        run: uv run pytest
+
+      - name: Package the Lambda functions
+        run: make build
+
+      - name: cdk synth (dev, all stacks)
+        # The account, domain and AuthKit domain are given at launch (docs/DEPLOY.md §3)
+        # and guard_account refuses to synth without them, so CI passes placeholders.
+        run: node_modules/.bin/cdk synth -c env=dev -c account=000000000000 -c domain=wiki-dev.example.com -c authkitDomain=https://example.authkit.app -c certificateArn="$SYNTH_CERT_ARN" --quiet
+
+      - name: Scan the deployment package for credential-shaped files
+        # `make build` copies app/ into build/; a stray .env or key file would ride
+        # along. gitleaks (below) covers the history; this covers what ships.
+        run: |
+          set -euo pipefail
+          # Every wheel ships a CA bundle as cacert.pem; those are public certificates.
+          if find build -type f \( -name '.env*' -o -name '*.pem' -o -name '*.key' -o -name 'credentials' \) ! -name 'cacert.pem' | grep .; then
+            echo "::error::credential-shaped file in the deployment package"; exit 1
+          fi
+          # botocore/data/*/examples-1.json carries the example access key from AWS's documentation.
+          if grep -rIlE 'AKIA[0-9A-Z]{16}|sk_(live|test)_[0-9a-zA-Z]{20,}' build --include='*.py' --include='*.json' --include='*.toml' --include='*.txt' --exclude-dir=data; then
+            echo "::error::credential-shaped string in the deployment package"; exit 1
+          fi
+
+      - name: pip-audit (Lambda dependencies)
+        # build/requirements.txt is exactly what `make build` installed, with hashes.
+        run: uv run pip-audit -r build/requirements.txt --disable-pip --require-hashes --progress-spinner off
+
+      - name: SBOM (CycloneDX)
+        if: always()
+        # The gate is the step above; this one only writes the inventory, so its exit
+        # code on findings is ignored.
+        run: uv run pip-audit -r build/requirements.txt --disable-pip --require-hashes --progress-spinner off -f cyclonedx-json -o build/sbom.cdx.json || true
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sbom
+          path: build/sbom.cdx.json
+          if-no-files-found: error
+
+  gitleaks:
+    name: secret scan (history)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      # gitleaks-action needs a paid licence for organisation repositories; the CLI
+      # image is free and scans the same history.
+      - name: gitleaks (full history)
+        run: >
+          docker run --rm -v "$PWD:/repo" -w /repo
+          ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+          git --redact --no-banner --exit-code 1 .

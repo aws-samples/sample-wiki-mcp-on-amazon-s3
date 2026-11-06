@@ -1,0 +1,156 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+"""§12.8 items 2 and 3, client side — the authorizer actually checks tokens.
+
+Rejections first (§12.8 item 2); a validator that accepts everything passes every
+happy-path test. Then the two positive checks: a real token works, and its ``aud``
+is byte-for-byte the ``resource`` the metadata document publishes (§2 check 3).
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import time
+from collections.abc import Callable
+from typing import Any
+
+import httpx
+import jwt
+import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+from app.config import ALL_SCOPES
+
+pytestmark = pytest.mark.security
+
+Call = Callable[..., httpx.Response]
+PING = "ping"
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _claims(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Claims that would pass every check except the signature: real issuer, real
+    audience, fresh timestamps, both scopes."""
+    now = int(time.time())
+    return {
+        "iss": metadata["authorization_servers"][0],
+        "aud": metadata["resource"],
+        "sub": "user_forged",
+        "scope": " ".join(ALL_SCOPES),
+        "iat": now,
+        "exp": now + 300,
+        "jti": "forged",
+    }
+
+
+def _assert_rejected(response: httpx.Response) -> None:
+    """AS-3: a token that fails AS-4 is a 401 with the discovery challenge — never a
+    403, never a 200 carrying an error payload."""
+    assert response.status_code == 401, f"{response.status_code}: {response.text[:300]}"
+    challenge = response.headers.get("www-authenticate", "")
+    assert challenge.startswith("Bearer") and "resource_metadata=" in challenge, challenge
+
+
+# ------------------------------------------------------------ rejections
+
+
+def test_garbage_bearer_rejected(http: httpx.Client, call: Call) -> None:
+    _assert_rejected(call(http, "not-a-token", PING))
+
+
+def test_self_signed_rs256_rejected(
+    http: httpx.Client, call: Call, metadata: dict[str, Any]
+) -> None:
+    """Right issuer, right audience, valid structure, signed by a key AuthKit has
+    never seen. Only the JWKS check can reject this."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    forged = jwt.encode(_claims(metadata), key, algorithm="RS256", headers={"kid": "forged"})
+    _assert_rejected(call(http, forged, PING))
+
+
+def test_alg_none_rejected(http: httpx.Client, call: Call, metadata: dict[str, Any]) -> None:
+    """AS-4: the algorithm is pinned, never read from the token's own header."""
+    header = _b64url(json.dumps({"alg": "none", "typ": "JWT"}).encode())
+    payload = _b64url(json.dumps(_claims(metadata)).encode())
+    _assert_rejected(call(http, f"{header}.{payload}.", PING))
+
+
+def test_wrong_audience_rejected(http: httpx.Client, call: Call, token_wrong_aud: str) -> None:
+    """A genuine AuthKit token minted for another resource indicator (§12.8 item 2)."""
+    _assert_rejected(call(http, token_wrong_aud, PING))
+
+
+def test_expired_rejected(http: httpx.Client, call: Call, token_expired: str) -> None:
+    """A genuine, once-valid token whose ``exp`` has passed (§12.8 item 2)."""
+    _assert_rejected(call(http, token_expired, PING))
+
+
+# ------------------------------------------------------------ the real token works
+
+
+def test_valid_token_ping(
+    http: httpx.Client, call: Call, token: str, rpc_result: Callable[..., Any]
+) -> None:
+    response = call(http, token, PING)
+    result = rpc_result(response)
+    assert response.json()["id"] == 1
+    assert isinstance(result, dict)
+
+
+def test_tools_list_contains_read_article(
+    http: httpx.Client, call: Call, token: str, rpc_result: Callable[..., Any]
+) -> None:
+    result = rpc_result(call(http, token, "tools/list", {}))
+    tools = result.get("tools")
+    assert isinstance(tools, list), result
+    names = {tool["name"] for tool in tools}
+    assert "read_article" in names, names
+
+
+# ------------------------------------------------------------ §2 check 3 / §12.8 item 3
+
+
+def _verified_claims(token: str, metadata: dict[str, Any]) -> dict[str, Any]:
+    # The server-side check is tested above (test_valid_token_ping and friends); this
+    # verifies the signature too, rather than trusting the wire, before reading what
+    # the authorization server put in the token. jwks_uri comes from the AS metadata
+    # document, not the protected-resource one `metadata` already is.
+    as_url = metadata["authorization_servers"][0].rstrip("/")
+    as_metadata = httpx.get(f"{as_url}/.well-known/oauth-authorization-server", timeout=20).json()
+    jwks_client = jwt.PyJWKClient(as_metadata["jwks_uri"])
+    signing_key = jwks_client.get_signing_key_from_jwt(token).key
+    return jwt.decode(
+        token,
+        key=signing_key,
+        algorithms=["RS256"],
+        options={"verify_aud": False, "verify_iss": False},
+    )
+
+
+def test_token_audience_is_canonical_resource(
+    token: str, metadata: dict[str, Any], base_url: str
+) -> None:
+    """``aud`` equals the published ``resource`` byte for byte — the check that
+    decides whether WorkOS honoured the resource indicator (§2, "why check 4")."""
+    aud = _verified_claims(token, metadata)["aud"]
+    if isinstance(aud, list):
+        assert len(aud) == 1, f"aud must name exactly this resource, got {aud}"
+        aud = aud[0]
+    assert aud == metadata["resource"]
+    assert aud == f"{base_url}/mcp"
+
+
+def test_token_issuer_is_advertised_authorization_server(
+    token: str, metadata: dict[str, Any]
+) -> None:
+    iss = _verified_claims(token, metadata)["iss"]
+    assert iss.rstrip("/") == metadata["authorization_servers"][0].rstrip("/")
+
+
+# §2 check 5 (the token's scope claim carries both custom scopes) does not apply:
+# WorkOS cannot issue scopes to a CIMD client, so the check tested a client type
+# no user has. `aud` and `iss` above are the assertions that matter.
