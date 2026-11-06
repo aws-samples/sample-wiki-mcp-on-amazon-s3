@@ -1,0 +1,53 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+# Dependabot — docs/ARCHITECTURE.md §12.4: pinned versions and automated update PRs. Nothing merges
+# them automatically: every PR waits for a person and for the `checks` job in
+# .github/workflows/ci.yml.
+#
+# Python dependencies are resolved by uv (`uv.lock`), so the ecosystem is `uv`, not
+# `pip`. The CDK CLI is pinned exactly in package.json / package-lock.json (`npm`).
+# Patch releases are grouped into one PR per ecosystem; minor and major updates
+# arrive as their own PRs. GitHub Actions are pinned to commit SHAs; Dependabot bumps
+# the SHA and its trailing version comment together.
+
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 10
+    groups:
+      python-patch:
+        patterns: ["*"]
+        update-types: ["patch"]
+    labels: ["dependencies"]
+
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/Los_Angeles"
+    groups:
+      npm-patch:
+        patterns: ["*"]
+        update-types: ["patch"]
+    labels: ["dependencies"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/Los_Angeles"
+    groups:
+      actions-patch:
+        patterns: ["*"]
+        update-types: ["patch"]
+    labels: ["dependencies"]

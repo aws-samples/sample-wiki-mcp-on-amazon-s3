@@ -1,0 +1,32 @@
+.venv/
+.idea/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+build/
+cdk.out/
+cdk.context.json
+node_modules/
+.env
+*.egg-info/
+.claude/
+**/__pycache__/**
+
+# AI agent / IDE internal notes (not part of the sample)
+.kiro/
+.agents/
+# Local archive of internal planning docs (not part of the sample)
+archive/
+
+# Local editor / shell / tooling files
+.DS_Store
+.env.*
+.envrc
+.vscode/
+dist/
+.coverage
+htmlcov/
+.mcp.json

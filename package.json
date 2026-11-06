@@ -1,0 +1,9 @@
+{
+  "name": "sample-wiki-mcp-on-amazon-s3",
+  "private": true,
+  "license": "MIT-0",
+  "description": "Pins the AWS CDK CLI that the Makefile and CI run.",
+  "devDependencies": {
+    "aws-cdk": "2.1145.0"
+  }
+}
